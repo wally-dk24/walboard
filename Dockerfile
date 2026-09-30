@@ -1,6 +1,7 @@
 # walboard — tiny CLI for your Plane kanban board
+# (multi-arch: linux/amd64, linux/arm64 — e.g. Raspberry Pi)
 #
-# Build:  docker build -t wallydk24/walboard .
+# Build:  podman build --platform linux/arm64 -t wallydk24/walboard:arm64 .
 # Run:    docker run --rm -e PLANE_API_KEY=$KEY \
 #           -e WALBOARD_WORKSPACE=<workspace-slug> \
 #           -e WALBOARD_PROJECT=<project-uuid> \
@@ -13,8 +14,7 @@ FROM python:3.12-alpine
 
 WORKDIR /app
 COPY walboard.py ./
-RUN adduser -D wb && chown -R wb:wb /app
-USER wb
+USER 1000
 
 ENTRYPOINT ["python3", "/app/walboard.py"]
 CMD ["--help"]
