@@ -35,3 +35,12 @@ so it survives custom state naming.
 ## License
 
 MIT
+
+## Docker
+
+```bash
+docker pull wallydk24/walboard
+docker run --rm -e PLANE_API_KEY=$KEY \
+  -e WALBOARD_WORKSPACE=<workspace-slug> -e WALBOARD_PROJECT=<project-uuid> \
+  wallydk24/walboard list
+```
