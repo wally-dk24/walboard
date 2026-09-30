@@ -8,10 +8,11 @@ Setup:
     export WALBOARD_PROJECT="your-project-id"
 
 Usage:
-    walboard list [--state backlog|in-progress|done]
+    walboard list [--state backlog|in-progress|done|cancelled]
     walboard show <issue-id>
     walboard add "Card title" [--desc "..."] [--label task|bug|idea] [--state backlog|in-progress]
-    walboard move <issue-id> backlog|in-progress|done
+    walboard move <issue-id> backlog|in-progress|done|cancelled
+    walboard edit <issue-id> [--title "..."] [--desc "..."]
 
 Everything uses the Python standard library — no dependencies.
 """
@@ -83,14 +84,16 @@ def state_ids(cfg: dict) -> dict:
     out = {}
     for s in res.get("results", res if isinstance(res, list) else []):
         name = (s.get("name") or "").strip().lower()
-        if "backlog" in name or "to do" in name:
+        if "cancel" in name:
+            out["cancelled"] = s["id"]
+        elif "backlog" in name or "to do" in name:
             out["backlog"] = s["id"]
         elif "progress" in name:
             out["in-progress"] = s["id"]
         elif "done" in name or "complete" in name:
             out["done"] = s["id"]
-    if not all(out.get(k) for k in ("backlog", "in-progress", "done")):
-        die("could not resolve backlog/in-progress/done state ids on this project")
+    if not all(out.get(k) for k in ("backlog", "in-progress", "done", "cancelled")):
+        die("could not resolve backlog/in-progress/done/cancelled state ids on this project")
     return out
 
 
@@ -171,13 +174,27 @@ def cmd_move(cfg: dict, args: argparse.Namespace) -> None:
     print(f"moved {short_id(issue_id)} -> {args.state}")
 
 
+def cmd_edit(cfg: dict, args: argparse.Namespace) -> None:
+    issue_id = resolve_issue(cfg, args.issue)
+    payload: dict = {}
+    if args.title:
+        payload["name"] = args.title
+    if args.desc is not None:
+        payload["description_html"] = (
+            "<p>" + args.desc.replace("\\n", "<br/>") + "</p>" if args.desc else "")
+    if not payload:
+        die("nothing to change: pass --title and/or --desc")
+    req(cfg, "PATCH", f"/issues/{issue_id}/", payload)
+    print(f"edited {short_id(issue_id)}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="walboard",
                                      description="Tiny CLI for your Plane kanban board.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("list", help="List cards.")
-    p.add_argument("--state", choices=["backlog", "in-progress", "done"])
+    p.add_argument("--state", choices=["backlog", "in-progress", "done", "cancelled"])
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("show", help="Show one card in detail.")
@@ -193,8 +210,14 @@ def main() -> None:
 
     p = sub.add_parser("move", help="Move a card between states.")
     p.add_argument("issue", help="Issue id (or its 8-char prefix).")
-    p.add_argument("state", choices=["backlog", "in-progress", "done"])
+    p.add_argument("state", choices=["backlog", "in-progress", "done", "cancelled"])
     p.set_defaults(func=cmd_move)
+
+    p = sub.add_parser("edit", help="Edit a card's title and/or description.")
+    p.add_argument("issue", help="Issue id (or its 8-char prefix).")
+    p.add_argument("--title", default="")
+    p.add_argument("--desc", default=None)
+    p.set_defaults(func=cmd_edit)
 
     args = parser.parse_args()
     cfg = config()
