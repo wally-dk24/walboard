@@ -44,3 +44,20 @@ docker run --rm -e PLANE_API_KEY=$KEY \
   -e WALBOARD_WORKSPACE=<workspace-slug> -e WALBOARD_PROJECT=<project-uuid> \
   wallydk24/walboard list
 ```
+
+## Web UI
+
+`walboard serve` runs a small kanban board UI in the shared wally-brand
+skin: backlog / in-progress / done columns, card detail pages, and
+add/move/edit forms. Credentials stay server-side — the browser never sees
+your Plane API key.
+
+```bash
+docker run -p 8080:8080 -e PLANE_API_KEY=$KEY \
+  -e WALBOARD_WORKSPACE=<workspace-slug> -e WALBOARD_PROJECT=<project-uuid> \
+  wallydk24/walboard serve
+# or locally:
+python3 walboard.py serve --port 8080
+```
+
+Then open http://localhost:8080/. `GET /healthz` returns `ok`.

@@ -109,11 +109,22 @@ def short_id(full: str) -> str:
     return full[:8]
 
 
-def cmd_list(cfg: dict, args: argparse.Namespace) -> None:
+def fetch_issues(cfg: dict) -> list:
+    """Return the project's issues (up to 100)."""
     res = req(cfg, "GET", "/issues/?per_page=100")
     items = res.get("results", res if isinstance(res, list) else [])
+    return sorted(items, key=lambda it: it.get("sequence_id", 0))
+
+
+def fetch_states(cfg: dict) -> tuple:
+    """Return (states: friendly-name -> id, names: id -> friendly-name)."""
     states = state_ids(cfg)
-    names = {v: k for k, v in states.items()}
+    return states, {v: k for k, v in states.items()}
+
+
+def cmd_list(cfg: dict, args: argparse.Namespace) -> None:
+    items = fetch_issues(cfg)
+    states, names = fetch_states(cfg)
     wanted = states.get(args.state) if args.state else None
     rows = []
     for it in items:
@@ -125,7 +136,6 @@ def cmd_list(cfg: dict, args: argparse.Namespace) -> None:
     if not rows:
         print("(no cards)")
         return
-    rows.sort(key=lambda r: r[0])
     for seq, sid, name, state_name in rows:
         print(f"{seq:>4}  {sid}  [{state_name}]  {name}")
 
@@ -219,9 +229,326 @@ def main() -> None:
     p.add_argument("--desc", default=None)
     p.set_defaults(func=cmd_edit)
 
+    sv = sub.add_parser("serve", help="Run the branded kanban board web UI.")
+    sv.add_argument("--host", default="0.0.0.0", help="Bind host (default 0.0.0.0).")
+    sv.add_argument("--port", type=int, default=8080, help="Port (default 8080).")
+    sv.set_defaults(func=cmd_serve)
+
     args = parser.parse_args()
+    if args.cmd == "serve":
+        cmd_serve(args)
+        return
     cfg = config()
     args.func(cfg, args)
+
+
+# ---------------------------------------------------------------- serve mode
+#
+#   walboard serve [--port 8080]
+#
+# A branded kanban board web UI over the Plane project: three columns
+# (backlog / in-progress / done), card detail pages, and add/move/edit
+# forms. Plane credentials stay server-side (PLANE_API_KEY /
+# ~/.config/walboard/api_key + WALBOARD_WORKSPACE / WALBOARD_PROJECT) —
+# the browser never sees them.
+#
+#   GET  /              board
+#   GET  /card?id=...   card detail
+#   POST /add           add a card
+#   POST /move          move a card
+#   POST /edit          edit a card
+#   GET  /healthz       "ok"
+
+WL_STYLE = """<style>
+.wl-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+.wl-col{background:#221c15;border:1px solid #332b21;border-radius:14px;padding:12px}
+.wl-col h3{margin:.2em .2em .8em;font-size:15px;color:#f3e6cf;
+  display:flex;align-items:center;gap:8px}
+.wl-card{display:block;background:#2b2318;border:1px solid #3d3222;border-radius:10px;
+  padding:10px 12px;margin-bottom:10px;text-decoration:none;color:inherit}
+.wl-card:hover{border-color:#7a5a2e}
+.wl-card .wl-seq{font-size:12px;color:#a49176}
+.wl-card .wl-title{font-weight:600;color:#f3e6cf;margin:.15em 0 .3em;line-height:1.4}
+.wl-labels{display:flex;gap:6px;flex-wrap:wrap}
+.wl-empty{color:#a49176;font-size:13px;font-style:italic;padding:4px 2px 10px}
+.wl-desc{color:#cbbfa8;line-height:1.6;white-space:pre-wrap;margin:1em 0}
+.wl-back{display:inline-block;margin-bottom:.6em;color:#e8a33d;font-size:14px;
+  text-decoration:none}
+.wl-add-grid{display:grid;grid-template-columns:2fr 2fr 1fr 1fr;gap:10px}
+@media (max-width:640px){.wl-add-grid{grid-template-columns:1fr}}
+</style>"""
+
+COLUMNS = ("backlog", "in-progress", "done")
+
+
+def _esc(s):
+    return ("" if s is None else str(s)).replace("&", "&amp;").replace(
+        "<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _desc_text(issue):
+    import re
+    import html as _h
+    raw = issue.get("description_html") or ""
+    text = _h.unescape(re.sub(r"<[^>]+>", " ", raw))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _label_badges(issue):
+    out = []
+    for l in issue.get("labels_list", []) or []:
+        out.append('<span class="wb-badge">%s</span>' % _esc(l.get("name", "")))
+    return " ".join(out)
+
+
+def _board_html(cfg, states, names):
+    try:
+        issues = fetch_issues(cfg)
+    except SystemExit:
+        return ('<div class="wb-card"><span class="wb-badge b-red">error</span>'
+                "<p>Could not reach the Plane API — check the server log.</p></div>")
+    cols = []
+    for col in COLUMNS:
+        sid = states.get(col)
+        cards = []
+        for it in issues:
+            if it.get("state") != sid:
+                continue
+            cards.append(
+                '<a class="wl-card" href="/card?id=%s">'
+                '<div class="wl-seq">#%s · %s</div>'
+                '<div class="wl-title">%s</div>'
+                '<div class="wl-labels">%s</div></a>'
+                % (_esc(it["id"]), _esc(it.get("sequence_id", "?")),
+                   _esc(short_id(it["id"])), _esc(it.get("name", "")),
+                   _label_badges(it)))
+        cols.append(
+            '<div class="wl-col"><h3>%s <span class="wb-badge">%d</span></h3>%s</div>'
+            % (_esc(col), len(cards),
+               "".join(cards) or '<div class="wl-empty">no cards</div>'))
+    add_form = """
+<div class="wb-card">
+  <h2>Add a card</h2>
+  <form action="/add" method="post">
+    <div class="wl-add-grid">
+      <div class="wb-field"><label for="a-title">Title</label>
+        <input class="wb-input" id="a-title" name="title" required maxlength="200"></div>
+      <div class="wb-field"><label for="a-desc">Description</label>
+        <input class="wb-input" id="a-desc" name="desc"></div>
+      <div class="wb-field"><label for="a-label">Label</label>
+        <select class="wb-select" id="a-label" name="label">
+          <option value="task">task</option><option value="bug">bug</option>
+          <option value="idea">idea</option></select></div>
+      <div class="wb-field"><label for="a-state">Column</label>
+        <select class="wb-select" id="a-state" name="state">
+          <option value="backlog">backlog</option>
+          <option value="in-progress">in-progress</option></select></div>
+    </div>
+    <div class="wb-btn-row">
+      <button class="wb-btn wb-btn-primary" type="submit">Add card</button>
+    </div>
+  </form>
+</div>"""
+    return add_form + '<div class="wl-cols">%s</div>' % "".join(cols)
+
+
+def _card_html(cfg, states, issue_id):
+    try:
+        issue = req(cfg, "GET", f"/issues/{issue_id}/")
+    except SystemExit:
+        return ('<div class="wb-card"><a class="wl-back" href="/">← board</a>'
+                '<span class="wb-badge b-red">error</span>'
+                "<p>Card not found.</p></div>")
+    names = {v: k for k, v in states.items()}
+    state_name = names.get(issue.get("state"), issue.get("state_name", ""))
+    opts = "".join(
+        '<option value="%s"%s>%s</option>' % (s, " selected" if s == state_name else "", s)
+        for s in ("backlog", "in-progress", "done", "cancelled"))
+    return """
+<div class="wb-card">
+  <a class="wl-back" href="/">← board</a>
+  <h2>#%(seq)s — %(name)s</h2>
+  <p><span class="wb-badge">%(state)s</span> %(labels)s</p>
+  %(desc)s
+</div>
+<div class="wb-card">
+  <h2>Move</h2>
+  <form action="/move" method="post">
+    <input type="hidden" name="id" value="%(id)s">
+    <div class="wb-field"><label for="m-state">Move to</label>
+      <select class="wb-select" id="m-state" name="state">%(opts)s</select></div>
+    <div class="wb-btn-row">
+      <button class="wb-btn wb-btn-primary" type="submit">Move card</button>
+    </div>
+  </form>
+</div>
+<div class="wb-card">
+  <h2>Edit</h2>
+  <form action="/edit" method="post">
+    <input type="hidden" name="id" value="%(id)s">
+    <div class="wb-field"><label for="e-title">Title</label>
+      <input class="wb-input" id="e-title" name="title" value="%(name_attr)s"></div>
+    <div class="wb-field"><label for="e-desc">Description</label>
+      <textarea class="wb-input" id="e-desc" name="desc" rows="4">%(desc_attr)s</textarea></div>
+    <div class="wb-btn-row">
+      <button class="wb-btn wb-btn-primary" type="submit">Save changes</button>
+    </div>
+  </form>
+</div>
+""" % {"seq": _esc(issue.get("sequence_id", "?")), "id": _esc(issue.get("id", "")),
+       "name": _esc(issue.get("name", "")), "name_attr": _esc(issue.get("name", "")),
+       "state": _esc(state_name), "labels": _label_badges(issue),
+       "desc": ('<div class="wl-desc">%s</div>' % _esc(_desc_text(issue))
+                if _desc_text(issue) else ""),
+       "desc_attr": _esc(_desc_text(issue)), "opts": opts}
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse, parse_qs
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from brand.page import render, brand_asset
+
+    try:
+        cfg = config()
+        states, _ = fetch_states(cfg)
+    except SystemExit:
+        cfg, states = None, {}
+
+    def shell(title, content):
+        return render("walboard", "Your Plane kanban board", title, content,
+                      footer_extra="walboard")
+
+    def need_cfg(handler):
+        if cfg is None:
+            handler._send(shell(
+                "Walboard",
+                '<div class="wb-card"><span class="wb-badge b-red">not configured'
+                '</span><p class="wb-sub">This server needs '
+                '<span class="rc-hash">WALBOARD_WORKSPACE</span>, '
+                '<span class="rc-hash">WALBOARD_PROJECT</span> and a Plane API key '
+                '(<span class="rc-hash">PLANE_API_KEY</span> or '
+                '<span class="rc-hash">~/.config/walboard/api_key</span>).'
+                "</p></div>"), code=500)
+            return False
+        return True
+
+    class BoardHandler(BaseHTTPRequestHandler):
+        server_version = "walboard/serve"
+
+        def log_message(self, fmt, *a):
+            sys.stderr.write("walboard: %s\n" % (fmt % a))
+
+        def _send(self, body, ctype="text/html; charset=utf-8", code=200):
+            data = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _redirect(self):
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+
+        def _form(self):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 1024 * 1024:
+                return None
+            return parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            asset = brand_asset(parsed.path)
+            if asset:
+                ctype, data = asset
+                return self._send(data, ctype)
+            if parsed.path == "/healthz":
+                return self._send("ok", "text/plain; charset=utf-8")
+            if not need_cfg(self):
+                return
+            if parsed.path in ("/", "/index.html"):
+                return self._send(WL_STYLE + shell(
+                    "Walboard", _board_html(cfg, states, {v: k for k, v in states.items()})))
+            if parsed.path == "/card":
+                issue_id = (parse_qs(parsed.query).get("id", [""])[0] or "").strip()
+                if not issue_id:
+                    self.send_error(400, "missing id")
+                    return
+                return self._send(WL_STYLE + shell(
+                    "Walboard", _card_html(cfg, states, issue_id)))
+            self.send_error(404)
+
+        def do_POST(self):
+            path = urlparse(self.path).path
+            if path not in ("/add", "/move", "/edit"):
+                self.send_error(404)
+                return
+            if not need_cfg(self):
+                return
+            form = self._form()
+            if form is None:
+                self.send_error(400, "bad form")
+                return
+            get = lambda k: (form.get(k, [""])[0] or "").strip()
+            try:
+                if path == "/add":
+                    title = get("title")
+                    if not title:
+                        self.send_error(400, "missing title")
+                        return
+                    label = get("label") or "task"
+                    if label not in ("task", "bug", "idea"):
+                        label = "task"
+                    state = get("state") or "backlog"
+                    if state not in ("backlog", "in-progress"):
+                        state = "backlog"
+                    payload = {"name": title, "state": states[state]}
+                    if get("desc"):
+                        payload["description_html"] = "<p>" + _esc(get("desc")) + "</p>"
+                    try:
+                        payload["labels"] = [label_id(cfg, label)]
+                    except SystemExit:
+                        pass  # label missing on project — create the card anyway
+                    req(cfg, "POST", "/issues/", payload)
+                elif path == "/move":
+                    issue_id, state = get("id"), get("state")
+                    if not issue_id or state not in states:
+                        self.send_error(400, "bad move")
+                        return
+                    req(cfg, "PATCH", f"/issues/{issue_id}/", {"state": states[state]})
+                else:  # /edit
+                    issue_id = get("id")
+                    if not issue_id:
+                        self.send_error(400, "missing id")
+                        return
+                    payload = {}
+                    if get("title"):
+                        payload["name"] = get("title")
+                    payload["description_html"] = (
+                        "<p>" + _esc(get("desc")).replace("\n", "<br/>") + "</p>"
+                        if get("desc") else "")
+                    if not payload.get("name") and not get("desc"):
+                        self.send_error(400, "nothing to change")
+                        return
+                    req(cfg, "PATCH", f"/issues/{issue_id}/", payload)
+            except SystemExit:
+                self.send_error(502, "Plane API error — check the server log")
+                return
+            self._redirect()
+
+    httpd = ThreadingHTTPServer((args.host, args.port), BoardHandler)
+    httpd.daemon_threads = True
+    host = "localhost" if args.host == "0.0.0.0" else args.host
+    print("walboard: serving the board UI at http://%s:%d/" % (host, args.port))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

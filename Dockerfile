@@ -14,7 +14,12 @@ FROM python:3.12-alpine
 
 WORKDIR /app
 COPY walboard.py ./
+COPY brand/ ./brand/
 USER 1000
+EXPOSE 8080
 
+# Web UI: docker run -p 8080:8080 -e PLANE_API_KEY=$KEY \
+#           -e WALBOARD_WORKSPACE=<slug> -e WALBOARD_PROJECT=<uuid> \
+#           wallydk24/walboard serve
 ENTRYPOINT ["python3", "/app/walboard.py"]
 CMD ["--help"]
