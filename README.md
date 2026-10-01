@@ -61,3 +61,7 @@ python3 walboard.py serve --port 8080
 ```
 
 Then open http://localhost:8080/. `GET /healthz` returns `ok`.
+
+> If you run behind a TLS-intercepting proxy (corporate MITM), mount your
+> CA into the container and point Python at it:
+> `-v /path/to/ca.crt:/ca.crt:ro -e SSL_CERT_FILE=/ca.crt`.
