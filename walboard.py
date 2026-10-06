@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 import urllib.error
@@ -58,24 +59,27 @@ def config() -> dict:
 
 
 def req(cfg: dict, method: str, path: str, data: dict | None = None) -> dict:
-    headers = {
-        "x-api-key": cfg["key"],
-        "Content-Type": "application/json",
-        "User-Agent": "walboard/0.1",
-    }
-    body = json.dumps(data).encode() if data is not None else None
-    request = urllib.request.Request(cfg["base"] + path, data=body,
-                                     headers=headers, method=method)
+    # Transport via curl, not urllib: Python's http.client cannot complete
+    # large chunked reads from api.plane.so through the egress proxy
+    # (persistent http.client.IncompleteRead, observed 2026-10-06), while
+    # curl handles the same responses fine. Same fix as plane_pages.py.
+    url = cfg["base"] + path
+    cmd = ["curl", "-s", "-m", "120", "-X", method,
+           "-H", "x-api-key: " + cfg["key"],
+           "-H", "Content-Type: application/json",
+           "-H", "User-Agent: walboard/0.1",
+           "-w", "\n%{http_code}", url]
+    if data is not None:
+        cmd += ["-d", json.dumps(data)]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=130).stdout
+    body_raw, _, code = out.rpartition("\n")
     try:
-        with urllib.request.urlopen(request, timeout=30) as resp:
-            raw = resp.read().decode()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        try:
-            detail = e.read().decode()
-        except Exception:
-            detail = ""
-        die(f"Plane API {method} {path} -> HTTP {e.code}: {detail[:200]}")
+        code = int(code.strip())
+    except ValueError:
+        die(f"Plane API {method} {path} -> curl transport error: {out[-200:]}")
+    if code >= 400:
+        die(f"Plane API {method} {path} -> HTTP {code}: {body_raw[:200]}")
+    return json.loads(body_raw) if body_raw.strip() else {}
 
 
 def state_ids(cfg: dict) -> dict:
